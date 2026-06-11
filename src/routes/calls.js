@@ -175,13 +175,49 @@ router.post('/webhook', async (req, res) => {
   processCallAsync(call, elder).catch(console.error);
 });
 
-// ── Internal async processor ──────────────────────────────────
-async function processCallAsync(call, elder) {
+// ── Custom transcript (paste or file upload from web tool) ───
+// POST /api/calls/analyse-custom
+// Body: { elder_id, transcript_text, notes? }
+// Returns the full analysis synchronously (waits for Gemini)
+router.post('/analyse-custom', auth, async (req, res) => {
+  const { elder_id, transcript_text, notes } = req.body;
+  if (!elder_id) return res.status(400).json({ error: 'elder_id is required' });
+  if (!transcript_text || !transcript_text.trim()) return res.status(400).json({ error: 'transcript_text is required' });
+
+  const elderRes = await pool.query('SELECT * FROM elders WHERE id = $1', [elder_id]);
+  if (!elderRes.rows[0]) return res.status(404).json({ error: 'Elder not found' });
+  const elder = elderRes.rows[0];
+
+  // Convert raw text into our transcript structure.
+  // Each non-empty line becomes an ELDER turn so Gemini has full context.
+  const turns = transcript_text
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean)
+    .map((line, i) => {
+      // Auto-detect speaker prefix like "ELDER:", "AI:", "Carer:", "Caregiver:", etc.
+      const speakerMatch = line.match(/^(AI|CARER|CAREGIVER|NURSE|ELDER|PATIENT|CALLER)[:\-\s]+/i);
+      if (speakerMatch) {
+        const speaker = /AI|CARER|CAREGIVER|NURSE|CALLER/i.test(speakerMatch[1]) ? 'AI' : 'ELDER';
+        return { speaker, text: line.slice(speakerMatch[0].length).trim(), timestamp: `00:0${i}:00` };
+      }
+      // No prefix — treat whole text as ELDER speech
+      return { speaker: 'ELDER', text: line, timestamp: `00:0${i}:00` };
+    });
+
+  const callRes = await pool.query(
+    `INSERT INTO calls (elder_id, call_timestamp, duration_seconds, raw_transcript, status, error_message)
+     VALUES ($1, NOW(), $2, $3, 'analysing', $4) RETURNING *`,
+    [elder_id, Math.ceil(transcript_text.length / 15), JSON.stringify({ turns, source: 'custom_web_tool' }), notes || null]
+  );
+  const call = callRes.rows[0];
+
+  // Run synchronously so the web tool gets immediate results
+  const schedulesRes = await pool.query(
+    'SELECT * FROM schedules WHERE elder_id = $1 AND is_active = TRUE', [elder.id]
+  );
+
   try {
-    const schedulesRes = await pool.query(
-      'SELECT * FROM schedules WHERE elder_id = $1 AND is_active = TRUE',
-      [elder.id]
-    );
     const analysis = await analyseCallTranscript(call, elder, schedulesRes.rows);
 
     await pool.query(
@@ -191,14 +227,21 @@ async function processCallAsync(call, elder) {
 
     const createdAlerts = await generateAlerts(elder.id, call.id, analysis);
     await notifyFromAlerts(elder.id, elder.name, createdAlerts);
-    console.log(`✅ Call ${call.id} analysis complete. Compliance: ${analysis.compliance_score}`);
+
+    return res.json({
+      call_id: call.id,
+      elder: { id: elder.id, name: elder.name },
+      analysis,
+      alerts: createdAlerts,
+      transcript_turns: turns.length,
+    });
   } catch (err) {
-    console.error(`❌ Failed to process call ${call.id}:`, err.message);
     await pool.query(
       `UPDATE calls SET status = 'failed', error_message = $1, updated_at = NOW() WHERE id = $2`,
       [err.message, call.id]
     );
+    return res.status(500).json({ error: 'Analysis failed', detail: err.message });
   }
-}
+});
 
 module.exports = router;
