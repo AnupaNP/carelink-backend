@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: carelink-backend
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: BACKEND_URL
+        sync: false
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
